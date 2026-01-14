@@ -1,68 +1,60 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const nodemailer = require('nodemailer');
-const { Pool } = require('pg');
-const { calculatePrice } = require('./pricing');
+const mysql = require('mysql2/promise');
 
 const app = express();
-const PORT = process.env.PORT || 10000; // Render default port
+const PORT = process.env.PORT || 10000;
 
 // Middleware
-app.use(cors()); // Allow all origins for now (configure for production later)
+app.use(cors());
 app.use(express.json());
 
-// Database Connection (Postgres)
-// Use connection string from environment variable DATABASE_URL
-let pool;
-if (process.env.DATABASE_URL) {
-    pool = new Pool({
-        connectionString: process.env.DATABASE_URL,
-        ssl: { rejectUnauthorized: false } // Required for Render Postgres
-    });
-    console.log("Connected to PostgreSQL");
-} else {
-    console.log("No DATABASE_URL found. Running in memory-only mode (No persistent storage).");
-}
-
-// Nodemailer Transporter
-const transporter = nodemailer.createTransport({
-    service: process.env.EMAIL_SERVICE || 'gmail', // e.g., 'gmail', 'hotmail'
-    auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS
-    }
+// Database Connection Pool
+const pool = mysql.createPool({
+    host: process.env.DB_HOST || 'mststudios.com',
+    user: process.env.DB_USER || 'u766997427_mst_user',
+    password: process.env.DB_PASSWORD || 'OsVIOPzdukp^1',
+    database: process.env.DB_NAME || 'u766997427_mst_backend',
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
 });
 
-// Initialize DB Tables (Run once on startup if DB is connected)
+// Initialize DB Tables
 const initDB = async () => {
-    if (!pool) return;
     try {
-        await pool.query(`
-      CREATE TABLE IF NOT EXISTS submissions (
-        id SERIAL PRIMARY KEY,
-        email TEXT NOT NULL,
-        message TEXT,
-        selections JSONB,
-        total_price INTEGER,
-        monthly_price INTEGER,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-        await pool.query(`
-      CREATE TABLE IF NOT EXISTS cookie_consents (
-        id SERIAL PRIMARY KEY,
-        user_agent TEXT,
-        ip_hash TEXT,
-        status TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-        console.log("Database tables initialized.");
+        const connection = await pool.getConnection();
+
+        await connection.query(`
+            CREATE TABLE IF NOT EXISTS price_calculator_submissions (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                email VARCHAR(255) NOT NULL,
+                message TEXT,
+                selections JSON,
+                totalPrice INT,
+                monthlyPrice INT,
+                priceEstimate TEXT,
+                createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
+        await connection.query(`
+            CREATE TABLE IF NOT EXISTS cookie_consent (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                status ENUM('accepted', 'rejected', 'custom') NOT NULL,
+                userAgent TEXT,
+                createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
+        console.log("Database tables initialized (MySQL).");
+        connection.release();
     } catch (err) {
-        console.error("Error initializing DB:", err);
+        console.error("Error initializing MySQL DB:", err);
     }
 };
+
 initDB();
 
 // ----------------------------------------------------
@@ -71,68 +63,43 @@ initDB();
 
 // GET / - Health Check
 app.get('/', (req, res) => {
-    res.send('MST Studios Backend is running.');
+    res.send('MST Studios Backend is running (MySQL Version).');
 });
 
 // POST /submit - Handle Calculator Submission
 app.post('/submit', async (req, res) => {
     try {
-        const { email, message, selections } = req.body;
+        const { email, message, selections, totalPrice, monthlyPrice, priceEstimate } = req.body;
 
-        if (!email || !selections) {
+        if (!email) {
             return res.status(400).json({ error: 'Missing required fields' });
         }
 
-        // 1. Calculate Price on Server (Source of Truth)
-        const { totalPrice, monthlyPrice, breakdown } = calculatePrice(selections);
+        // Use backend logic to validate or trust frontend? 
+        // User requested storing frontend data. 
+        // We will store exactly what is sent.
 
-        // 2. Log to Database (if available)
-        if (pool) {
-            await pool.query(
-                'INSERT INTO submissions (email, message, selections, total_price, monthly_price) VALUES ($1, $2, $3, $4, $5)',
-                [email, message, JSON.stringify(selections), totalPrice, monthlyPrice]
-            );
-        }
+        const [result] = await pool.execute(
+            'INSERT INTO price_calculator_submissions (email, message, selections, totalPrice, monthlyPrice, priceEstimate) VALUES (?, ?, ?, ?, ?, ?)',
+            [
+                email,
+                message || '',
+                JSON.stringify(selections || {}),
+                totalPrice || 0,
+                monthlyPrice || 0,
+                priceEstimate || ''
+            ]
+        );
 
-        // 3. Send Email Notification to Admin (You)
-        const mailOptions = {
-            from: process.env.EMAIL_USER,
-            to: process.env.EMAIL_RECEIVER || process.env.EMAIL_USER, // Send to yourself
-            subject: `Ny Prisberegning fra ${email} - ${totalPrice} kr`,
-            text: `
-        Ny henvendelse fra Prisberegneren:
-
-        Email: ${email}
-        Besked: ${message}
-
-        ----------------------------------------
-        Beregnet Pris: ${totalPrice} kr.
-        Månedlig: ${monthlyPrice} kr/md.
-        ----------------------------------------
-
-        Valgte Muligheder:
-        ${JSON.stringify(selections, null, 2)}
-      `
-        };
-
-        // Only attempt to send if credentials are set
-        if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
-            await transporter.sendMail(mailOptions);
-        } else {
-            console.log('Skipping email sending (credentials missing). Logged: ', mailOptions);
-        }
-
-        // 4. Return success and the confirmed price
         res.json({
             success: true,
-            message: 'Submission received',
-            totalPrice,
-            monthlyPrice
+            message: 'Submission saved to database',
+            id: result.insertId
         });
 
     } catch (error) {
         console.error('Error in /submit:', error);
-        res.status(500).json({ error: 'Internal Server Error' });
+        res.status(500).json({ error: "Database insert failed" });
     }
 });
 
@@ -140,33 +107,17 @@ app.post('/submit', async (req, res) => {
 app.post('/cookie-consent', async (req, res) => {
     try {
         const { status, userAgent } = req.body;
-        // Note: Storing IP/UserAgent requires strict GDPR compliance. 
-        // Usually a simple "true" cookie on client is enough.
-        // We will simulate logging here if requested.
 
-        if (pool) {
-            // Anonymizing IP for basic privacy (hashing or just neglecting it)
-            const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-            await pool.query(
-                'INSERT INTO cookie_consents (user_agent, ip_hash, status) VALUES ($1, $2, $3)',
-                [userAgent || 'unknown', 'anonymized', status]
-            );
-        }
+        await pool.execute(
+            'INSERT INTO cookie_consent (status, userAgent) VALUES (?, ?)',
+            [status, userAgent || 'unknown']
+        );
 
         res.json({ success: true, status });
     } catch (error) {
         console.error('Error in /cookie-consent:', error);
-        res.status(500).json({ error: 'Internal Server Error' });
+        res.status(500).json({ error: 'Database insert failed' });
     }
-});
-
-// GET /cookie-consent-status
-app.get('/cookie-consent-status', (req, res) => {
-    // Since this is a REST API without session cookies, we can't identify the user easily 
-    // without them sending a token. 
-    // Typically, the frontend checks its own localStorage.
-    // We will return a generic message or expect a query param/token if implemented fully.
-    res.json({ message: "Check client-side localStorage for active consent state." });
 });
 
 // Start Server
